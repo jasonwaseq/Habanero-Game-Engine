@@ -1,0 +1,53 @@
+[workspace]
+members = [
+    "crates/engine-core",
+    "crates/engine-ecs",
+    "crates/engine-scene",
+    "crates/engine-render",
+    "crates/engine-assets",
+    "crates/engine-audio",
+    "crates/engine-physics",
+    "crates/engine-scripting",
+    "crates/engine-editor",
+    "apps/runtime-demo",
+    "apps/editor",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+version = "0.1.0"
+authors = ["Habanero Engine Contributors"]
+
+[workspace.dependencies]
+anyhow = "1"
+ash = "0.38"
+ash-window = "0.13"
+bytemuck = { version = "1", features = ["derive"] }
+crossbeam-channel = "0.5"
+dashmap = "6"
+egui = "0.31"
+egui-winit = "0.31"
+glam = { version = "0.30", features = ["bytemuck", "serde"] }
+notify = "8"
+parking_lot = "0.12"
+rayon = "1.10"
+rhai = "1.20"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+winit = "0.30"
+kira = "0.9"
+
+[workspace.lints.rust]
+unsafe_code = "warn"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+unwrap_used = "deny"

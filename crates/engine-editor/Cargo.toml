@@ -1,0 +1,11 @@
+[package]
+name = "engine-editor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+egui.workspace = true
+serde.workspace = true
+engine-ecs = { path = "../engine-ecs" }
+engine-scene = { path = "../engine-scene" }

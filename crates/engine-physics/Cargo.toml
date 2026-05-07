@@ -1,0 +1,11 @@
+[package]
+name = "engine-physics"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+glam.workspace = true
+serde.workspace = true
+tracing.workspace = true
+engine-ecs = { path = "../engine-ecs" }
