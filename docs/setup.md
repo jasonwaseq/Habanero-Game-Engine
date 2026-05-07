@@ -5,6 +5,7 @@
 - Rust stable toolchain (`rustup default stable`)
 - Vulkan SDK + validation layers installed
 - Graphics driver supporting Vulkan 1.2+
+- Linux (Ubuntu/Debian) audio build deps for `kira`/`cpal`: `pkg-config` and `libasound2-dev`
 
 ## Commands
 
