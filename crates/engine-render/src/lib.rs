@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use ash::vk;
+use engine_assets::MeshAsset;
 use engine_scene::Scene;
 use glam::{Mat4, Vec3A};
 use parking_lot::RwLock;
@@ -149,6 +150,9 @@ pub struct VulkanRenderer {
     pub frame_time_ms: f32,
     pub gpu_memory_budget_mb: u32,
     pub stats: RenderStats,
+    next_mesh_id: u32,
+    default_mesh: Option<MeshId>,
+    mesh_assets: HashMap<MeshId, MeshAsset>,
     backend: Option<VulkanBackend>,
     surface_format: vk::Format,
 }
@@ -162,6 +166,9 @@ impl VulkanRenderer {
             frame_time_ms: 0.0,
             gpu_memory_budget_mb: 512,
             stats: RenderStats::default(),
+            next_mesh_id: 1,
+            default_mesh: None,
+            mesh_assets: HashMap::new(),
             backend: None,
             surface_format: vk::Format::B8G8R8A8_UNORM,
         })
@@ -182,9 +189,27 @@ impl VulkanRenderer {
             frame_time_ms: 0.0,
             gpu_memory_budget_mb: 512,
             stats: RenderStats::default(),
+            next_mesh_id: 1,
+            default_mesh: None,
+            mesh_assets: HashMap::new(),
             backend,
             surface_format: vk::Format::B8G8R8A8_UNORM,
         })
+    }
+
+    pub fn register_mesh(&mut self, mesh: MeshAsset) -> MeshId {
+        let id = MeshId(self.next_mesh_id);
+        self.next_mesh_id = self.next_mesh_id.saturating_add(1);
+        self.mesh_assets.insert(id, mesh.clone());
+        if self.default_mesh.is_none() {
+            self.default_mesh = Some(id);
+        }
+        if let Some(backend) = self.backend.as_mut() {
+            if let Err(error) = backend.upload_mesh(id, &mesh) {
+                tracing::warn!(?error, "failed to upload mesh to Vulkan backend");
+            }
+        }
+        id
     }
 
     pub fn register_material(&mut self, id: MaterialId, material: Material) {
@@ -198,7 +223,7 @@ impl VulkanRenderer {
             .map(|(_entity, model)| DrawPacket {
                 model,
                 material: MaterialId(0),
-                mesh: MeshId(0),
+                mesh: self.default_mesh.unwrap_or(MeshId(0)),
             })
             .collect();
         RenderWorld { draw_packets }
@@ -231,7 +256,7 @@ impl VulkanRenderer {
             self.gpu_memory_budget_mb = (stats.extent.width.saturating_mul(stats.extent.height) / 4096)
                 .max(256);
             let _swapchain_info = (stats.swapchain_images, stats.swapchain_format);
-            if let Err(error) = backend.render_gbuffer_frame() {
+            if let Err(error) = backend.render_gbuffer_frame(render_world) {
                 tracing::warn!(?error, "gbuffer pass execution failed");
             }
         }

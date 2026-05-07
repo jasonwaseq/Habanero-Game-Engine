@@ -34,6 +34,21 @@ pub struct AssetManager {
     _watcher: Option<RecommendedWatcher>,
 }
 
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct MeshVertex {
+    pub position: [f32; 3],
+    pub normal: [f32; 3],
+    pub uv: [f32; 2],
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MeshAsset {
+    pub name: String,
+    pub vertices: Vec<MeshVertex>,
+    pub indices: Vec<u32>,
+}
+
 impl AssetManager {
     pub fn new() -> Self {
         Self {
@@ -87,6 +102,80 @@ impl AssetManager {
         self.cache.insert(id, Arc::new(bytes));
         *self.generation.write() += 1;
         Ok(())
+    }
+
+    pub fn load_gltf_meshes(&self, path: impl AsRef<Path>) -> Result<Vec<MeshAsset>> {
+        let (document, buffers, _) = gltf::import(path.as_ref())?;
+        let mut meshes = Vec::new();
+        for mesh in document.meshes() {
+            for primitive in mesh.primitives() {
+                let reader = primitive.reader(|buffer| Some(&buffers[buffer.index()]));
+                let positions = reader
+                    .read_positions()
+                    .ok_or_else(|| anyhow::anyhow!("gltf primitive missing positions"))?
+                    .collect::<Vec<_>>();
+                let normals = reader
+                    .read_normals()
+                    .map(|iter| iter.collect::<Vec<_>>())
+                    .unwrap_or_else(|| vec![[0.0, 1.0, 0.0]; positions.len()]);
+                let uvs = reader
+                    .read_tex_coords(0)
+                    .map(|coords| coords.into_f32().collect::<Vec<_>>())
+                    .unwrap_or_else(|| vec![[0.0, 0.0]; positions.len()]);
+                let vertices = positions
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, pos)| MeshVertex {
+                        position: *pos,
+                        normal: normals.get(idx).copied().unwrap_or([0.0, 1.0, 0.0]),
+                        uv: uvs.get(idx).copied().unwrap_or([0.0, 0.0]),
+                    })
+                    .collect::<Vec<_>>();
+                let indices = reader
+                    .read_indices()
+                    .map(|indices| indices.into_u32().collect::<Vec<_>>())
+                    .unwrap_or_else(|| (0..vertices.len() as u32).collect::<Vec<_>>());
+                meshes.push(MeshAsset {
+                    name: mesh
+                        .name()
+                        .map(ToString::to_string)
+                        .unwrap_or_else(|| format!("mesh_{}", mesh.index())),
+                    vertices,
+                    indices,
+                });
+            }
+        }
+        if meshes.is_empty() {
+            return Err(anyhow::anyhow!("no meshes found in gltf"));
+        }
+        Ok(meshes)
+    }
+
+    pub fn fallback_cube_mesh(&self) -> MeshAsset {
+        // Minimal indexed cube to keep demo rendering even without external assets.
+        let verts = vec![
+            MeshVertex { position: [-0.5, -0.5, -0.5], normal: [0.0, 0.0, -1.0], uv: [0.0, 0.0] },
+            MeshVertex { position: [0.5, -0.5, -0.5], normal: [0.0, 0.0, -1.0], uv: [1.0, 0.0] },
+            MeshVertex { position: [0.5, 0.5, -0.5], normal: [0.0, 0.0, -1.0], uv: [1.0, 1.0] },
+            MeshVertex { position: [-0.5, 0.5, -0.5], normal: [0.0, 0.0, -1.0], uv: [0.0, 1.0] },
+            MeshVertex { position: [-0.5, -0.5, 0.5], normal: [0.0, 0.0, 1.0], uv: [0.0, 0.0] },
+            MeshVertex { position: [0.5, -0.5, 0.5], normal: [0.0, 0.0, 1.0], uv: [1.0, 0.0] },
+            MeshVertex { position: [0.5, 0.5, 0.5], normal: [0.0, 0.0, 1.0], uv: [1.0, 1.0] },
+            MeshVertex { position: [-0.5, 0.5, 0.5], normal: [0.0, 0.0, 1.0], uv: [0.0, 1.0] },
+        ];
+        let idx = vec![
+            0, 1, 2, 2, 3, 0, // back
+            4, 6, 5, 6, 4, 7, // front
+            0, 4, 5, 5, 1, 0, // bottom
+            3, 2, 6, 6, 7, 3, // top
+            1, 5, 6, 6, 2, 1, // right
+            0, 3, 7, 7, 4, 0, // left
+        ];
+        MeshAsset {
+            name: "fallback_cube".to_string(),
+            vertices: verts,
+            indices: idx,
+        }
     }
 }
 

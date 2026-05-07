@@ -29,6 +29,7 @@ crossbeam-channel = "0.5"
 dashmap = "6"
 egui = "0.31"
 egui-winit = "0.31"
+gltf = "1.4"
 glam = { version = "0.30", features = ["bytemuck", "serde"] }
 notify = "8"
 parking_lot = "0.12"

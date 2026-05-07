@@ -18,4 +18,5 @@ thiserror.workspace = true
 tracing.workspace = true
 winit.workspace = true
 engine-ecs = { path = "../engine-ecs" }
+engine-assets = { path = "../engine-assets" }
 engine-scene = { path = "../engine-scene" }

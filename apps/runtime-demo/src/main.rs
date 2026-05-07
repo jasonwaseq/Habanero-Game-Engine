@@ -32,6 +32,27 @@ impl RuntimeApp {
     }
 
     fn seed_scene(engine: &mut Engine, stress_entities: usize) {
+        let enable_mesh_path = std::env::var("HBN_ENABLE_MESH_PATH")
+            .ok()
+            .as_deref()
+            == Some("1");
+        if enable_mesh_path {
+            let mesh_assets = engine
+                .assets
+                .load_gltf_meshes("assets/src/sample_mesh.gltf")
+                .unwrap_or_else(|error| {
+                    tracing::warn!(?error, "failed to load sample gltf mesh, using fallback cube");
+                    vec![engine.assets.fallback_cube_mesh()]
+                });
+            for mesh in mesh_assets {
+                let mesh_id = engine.renderer.register_mesh(mesh.clone());
+                tracing::info!(mesh = mesh.name, mesh_id = mesh_id.0, "registered render mesh");
+            }
+        } else {
+            tracing::warn!(
+                "mesh asset path disabled by default; set HBN_ENABLE_MESH_PATH=1 to enable experimental milestone #1"
+            );
+        }
         match Scene::load_json("assets/src/sample_scene.json") {
             Ok(scene) => engine.scene = scene,
             Err(_) => {
@@ -92,7 +113,15 @@ impl ApplicationHandler for RuntimeApp {
             }
         };
 
-        let mut engine = match Engine::new_with_window(&window).or_else(|_| Engine::new()) {
+        let use_vulkan = std::env::var("HBN_ENABLE_VULKAN")
+            .ok()
+            .as_deref()
+            == Some("1");
+        let mut engine = match if use_vulkan {
+            Engine::new_with_window(&window).or_else(|_| Engine::new())
+        } else {
+            Engine::new()
+        } {
             Ok(engine) => engine,
             Err(error) => {
                 tracing::error!(?error, "failed to initialize engine");
@@ -100,6 +129,9 @@ impl ApplicationHandler for RuntimeApp {
                 return;
             }
         };
+        if !use_vulkan {
+            tracing::warn!("Vulkan disabled by default; set HBN_ENABLE_VULKAN=1 to test Vulkan backend");
+        }
         if engine.renderer.is_backend_active() {
             window.set_title("Habanero Runtime [Vulkan]");
             tracing::info!("Vulkan backend active");
