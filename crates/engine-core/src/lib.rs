@@ -13,6 +13,7 @@ use engine_scene::Scene;
 use engine_scripting::ScriptHost;
 use parking_lot::RwLock;
 use rayon::{ThreadPool, ThreadPoolBuilder};
+use winit::window::Window;
 
 pub trait EnginePlugin: Send + Sync {
     fn name(&self) -> &'static str;
@@ -51,6 +52,7 @@ pub struct Engine {
     pub world: World,
     pub event_bus: EventBus,
     pub frame_index: u64,
+    pub metrics: FrameMetrics,
     pub job_system: JobSystem,
     pub scripts: ScriptHost,
     events_tx: Sender<EngineEvent>,
@@ -59,16 +61,31 @@ pub struct Engine {
     running: bool,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FrameMetrics {
+    pub dt_seconds: f32,
+    pub fps: f32,
+}
+
 impl Engine {
     pub fn new() -> Result<Self> {
+        Self::new_inner(VulkanRenderer::new()?)
+    }
+
+    pub fn new_with_window(window: &Window) -> Result<Self> {
+        Self::new_inner(VulkanRenderer::new_with_window(window)?)
+    }
+
+    fn new_inner(renderer: VulkanRenderer) -> Result<Self> {
         let (events_tx, events_rx) = unbounded();
         Ok(Self {
             scene: Scene::new(),
-            renderer: VulkanRenderer::new()?,
+            renderer,
             assets: AssetManager::new(),
             world: World::new(),
             event_bus: EventBus::default(),
             frame_index: 0,
+            metrics: FrameMetrics::default(),
             job_system: JobSystem::new(num_cpus())?,
             scripts: ScriptHost::new(),
             events_tx,
@@ -90,6 +107,10 @@ impl Engine {
 
     pub fn tick(&mut self, delta_time: Duration) {
         let dt_seconds = delta_time.as_secs_f32();
+        self.metrics.dt_seconds = dt_seconds;
+        if dt_seconds > 0.000_001 {
+            self.metrics.fps = 1.0 / dt_seconds;
+        }
         self.job_system.scope(|scope| {
             scope.spawn(|_| {
                 PhysicsSystem::step(&self.scene.world, dt_seconds);
@@ -101,6 +122,8 @@ impl Engine {
         let camera = Camera::perspective(16.0 / 9.0, 60f32.to_radians(), 0.1, 2000.0);
         let extracted = self.renderer.extract_scene(&self.scene);
         let visible = self.renderer.cull_visible(&extracted, &camera);
+        self.renderer
+            .update_stats(extracted.draw_packets.len(), visible.draw_packets.len());
         self.renderer.submit(&visible);
         self.frame_index = self.frame_index.saturating_add(1);
         self.event_bus.push(delta_time);

@@ -3,11 +3,13 @@ name = "runtime-demo"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+default-run = "runtime-demo"
 
 [dependencies]
 anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+winit.workspace = true
 engine-assets = { path = "../../crates/engine-assets" }
 engine-core = { path = "../../crates/engine-core" }
 engine-ecs = { path = "../../crates/engine-ecs" }

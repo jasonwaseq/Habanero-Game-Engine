@@ -91,6 +91,7 @@ See `docs/performance.md` for profiling and benchmark guidance.
 cargo check
 cargo test
 cargo run -p runtime-demo
+cargo run -p runtime-demo -- --stress=50000
 cargo run -p editor-app
 ```
 
@@ -100,7 +101,17 @@ cargo run -p editor-app
 - 3D lit scene baseline
 - ECS throughput stress test
 - Asset hot reload loop for shaders/textures
-- Runtime HUD metrics (FPS/entity/draw-call/memory placeholders)
+- Runtime live perf metrics (FPS/frame ms/entity count/draw calls/culling ratio in title bar)
+
+## Next Implementation Steps
+
+- **Deferred lighting completion**: split G-buffer and lighting into separate subpasses/pipelines, sample G-buffer in lighting pass, and add directional light uniforms.
+- **Real scene draw path**: stream mesh vertex/index buffers, issue instanced draws from extracted render packets, and replace fullscreen debug draw as the primary pass.
+- **GPU resource system**: add per-frame descriptor set ring, transient attachment allocator, and pipeline cache serialization.
+- **Render graph execution**: move pass order/resources from hardcoded sequence to explicit graph nodes and dependencies.
+- **Performance instrumentation**: add CPU/GPU frame timelines, percentile stats (p50/p95/p99), and CSV capture for benchmark runs.
+- **Scalable ECS queries**: add multi-component query joins and system dependency graph with conflict detection.
+- **Robust demo scenario**: ship fixed benchmark presets (10k/50k/100k entities), automated camera flythrough, and reproducible performance report output.
 
 ## Resume-Worthy Scope
 
