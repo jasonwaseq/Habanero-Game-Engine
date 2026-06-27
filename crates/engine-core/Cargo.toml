@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 crossbeam-channel.workspace = true
+glam.workspace = true
 parking_lot.workspace = true
 rayon.workspace = true
 tracing.workspace = true

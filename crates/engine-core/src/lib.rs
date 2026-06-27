@@ -11,6 +11,7 @@ use engine_physics::PhysicsSystem;
 use engine_render::{Camera, VulkanRenderer};
 use engine_scene::Scene;
 use engine_scripting::ScriptHost;
+use glam::Vec3;
 use parking_lot::RwLock;
 use rayon::{ThreadPool, ThreadPoolBuilder};
 use winit::window::Window;
@@ -45,6 +46,31 @@ impl JobSystem {
     }
 }
 
+/// Orbiting demo camera configuration. The camera circles `target` at
+/// `radius`/`height`, providing an automatic, hands-free flythrough.
+#[derive(Debug, Clone, Copy)]
+pub struct CameraController {
+    pub target: [f32; 3],
+    pub radius: f32,
+    pub height: f32,
+    pub orbit_speed: f32,
+    pub fov_y_radians: f32,
+    pub aspect: f32,
+}
+
+impl Default for CameraController {
+    fn default() -> Self {
+        Self {
+            target: [0.0, 0.0, 0.0],
+            radius: 26.0,
+            height: 14.0,
+            orbit_speed: 0.2,
+            fov_y_radians: 60f32.to_radians(),
+            aspect: 16.0 / 9.0,
+        }
+    }
+}
+
 pub struct Engine {
     pub scene: Scene,
     pub renderer: VulkanRenderer,
@@ -55,6 +81,8 @@ pub struct Engine {
     pub metrics: FrameMetrics,
     pub job_system: JobSystem,
     pub scripts: ScriptHost,
+    pub camera: CameraController,
+    pub elapsed_seconds: f32,
     events_tx: Sender<EngineEvent>,
     events_rx: Receiver<EngineEvent>,
     plugins: Vec<Arc<dyn EnginePlugin>>,
@@ -65,6 +93,8 @@ pub struct Engine {
 pub struct FrameMetrics {
     pub dt_seconds: f32,
     pub fps: f32,
+    pub visible_draws: usize,
+    pub culled_ratio: f32,
 }
 
 impl Engine {
@@ -88,11 +118,44 @@ impl Engine {
             metrics: FrameMetrics::default(),
             job_system: JobSystem::new(num_cpus())?,
             scripts: ScriptHost::new(),
+            camera: CameraController::default(),
+            elapsed_seconds: 0.0,
             events_tx,
             events_rx,
             plugins: Vec::new(),
             running: true,
         })
+    }
+
+    /// Update the camera aspect ratio for the given surface size without
+    /// touching GPU resources. Used for initial setup.
+    pub fn set_aspect(&mut self, width: u32, height: u32) {
+        if width != 0 && height != 0 {
+            self.camera.aspect = width as f32 / height as f32;
+        }
+    }
+
+    /// Update the camera aspect ratio and recreate the renderer surface after a
+    /// window resize.
+    pub fn resize(&mut self, width: u32, height: u32) {
+        if width == 0 || height == 0 {
+            return;
+        }
+        self.camera.aspect = width as f32 / height as f32;
+        self.renderer.resize();
+    }
+
+    /// Build the current frame's orbiting camera.
+    pub fn current_camera(&self) -> Camera {
+        let angle = self.elapsed_seconds * self.camera.orbit_speed;
+        let target = Vec3::from_array(self.camera.target);
+        let eye = target
+            + Vec3::new(
+                angle.cos() * self.camera.radius,
+                self.camera.height,
+                angle.sin() * self.camera.radius,
+            );
+        Camera::looking_at(eye, target, self.camera.aspect, self.camera.fov_y_radians)
     }
 
     pub fn register_plugin<P: EnginePlugin + 'static>(&mut self, plugin: P) -> Result<()> {
@@ -106,25 +169,42 @@ impl Engine {
     }
 
     pub fn tick(&mut self, delta_time: Duration) {
-        let dt_seconds = delta_time.as_secs_f32();
+        let dt_seconds = delta_time.as_secs_f32().min(0.1);
         self.metrics.dt_seconds = dt_seconds;
         if dt_seconds > 0.000_001 {
             self.metrics.fps = 1.0 / dt_seconds;
         }
+        self.elapsed_seconds += dt_seconds;
+
+        // Advance simulation on the job system to demonstrate off-main-thread
+        // frame preparation, then read back the change set.
         self.job_system.scope(|scope| {
             scope.spawn(|_| {
                 PhysicsSystem::step(&self.scene.world, dt_seconds);
             });
-            scope.spawn(|_| {
-                let _ = self.scene.world.changed::<engine_ecs::Transform>();
-            });
         });
-        let camera = Camera::perspective(16.0 / 9.0, 60f32.to_radians(), 0.1, 2000.0);
+        let _changed = self.scene.world.changed::<engine_ecs::Transform>();
+
+        let camera = self.current_camera();
+        let light_dir = Vec3::new(
+            (self.elapsed_seconds * 0.35).cos() * 0.6,
+            -1.0,
+            (self.elapsed_seconds * 0.35).sin() * 0.6,
+        )
+        .normalize();
+
         let extracted = self.renderer.extract_scene(&self.scene);
         let visible = self.renderer.cull_visible(&extracted, &camera);
-        self.renderer
-            .update_stats(extracted.draw_packets.len(), visible.draw_packets.len());
-        self.renderer.submit(&visible);
+        let extracted_count = extracted.draw_packets.len();
+        let visible_count = visible.draw_packets.len();
+        self.renderer.update_stats(extracted_count, visible_count);
+        self.metrics.visible_draws = visible_count;
+        self.metrics.culled_ratio = if extracted_count > 0 {
+            1.0 - (visible_count as f32 / extracted_count as f32)
+        } else {
+            0.0
+        };
+        self.renderer.submit(&visible, &camera, light_dir);
         self.frame_index = self.frame_index.saturating_add(1);
         self.event_bus.push(delta_time);
     }

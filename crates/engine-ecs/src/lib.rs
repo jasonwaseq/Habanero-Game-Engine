@@ -163,6 +163,41 @@ impl World {
         self.query::<T>().into_par_iter().map(f).collect()
     }
 
+    /// Mutate every component of type `T` in place under a single write lock.
+    ///
+    /// This is the high-throughput write path: it avoids the per-entity
+    /// clone+reinsert round-trip of `query` + `insert` and marks every touched
+    /// component as changed for downstream change-detection. The callback must
+    /// not call back into the same world (the storage map is locked).
+    pub fn for_each_mut<T, F>(&self, mut f: F)
+    where
+        T: Component,
+        F: FnMut(Entity, &mut T),
+    {
+        let mut storages = self.storages.write();
+        let Some(storage) = storages.get_mut(&TypeId::of::<T>()) else {
+            return;
+        };
+        let set = storage
+            .as_any_mut()
+            .downcast_mut::<SparseSet<T>>()
+            .expect("storage type mismatch");
+        for idx in 0..set.dense.len() {
+            f(set.entities[idx], &mut set.dense[idx]);
+            set.changed[idx] = true;
+        }
+    }
+
+    /// Number of components currently stored for type `T`.
+    pub fn count<T: Component>(&self) -> usize {
+        let storages = self.storages.read();
+        storages
+            .get(&TypeId::of::<T>())
+            .and_then(|storage| storage.as_any().downcast_ref::<SparseSet<T>>())
+            .map(|set| set.dense.len())
+            .unwrap_or(0)
+    }
+
     pub fn clear_change_flags<T: Component>(&self) -> Result<(), EcsError> {
         let mut storages = self.storages.write();
         let Some(storage) = storages.get_mut(&TypeId::of::<T>()) else {
@@ -263,5 +298,57 @@ mod tests {
         assert_eq!(changed.len(), 1);
         world.clear_change_flags::<Transform>().expect("clear flags");
         assert!(world.changed::<Transform>().is_empty());
+    }
+
+    #[test]
+    fn for_each_mut_updates_in_place_and_marks_changed() {
+        let world = World::new();
+        let e = world.spawn();
+        world.insert(e, Transform::default());
+        world.clear_change_flags::<Transform>().expect("clear flags");
+        world.for_each_mut::<Transform, _>(|_, t| {
+            t.translation[0] = 5.0;
+        });
+        let t = world.get::<Transform>(e).expect("transform");
+        assert_eq!(t.translation[0], 5.0);
+        assert_eq!(world.changed::<Transform>().len(), 1);
+    }
+
+    #[test]
+    fn count_reflects_storage_size() {
+        let world = World::new();
+        assert_eq!(world.count::<Transform>(), 0);
+        for _ in 0..10 {
+            let e = world.spawn();
+            world.insert(e, Transform::default());
+        }
+        assert_eq!(world.count::<Transform>(), 10);
+    }
+
+    #[test]
+    fn swap_remove_keeps_sparse_indices_consistent() {
+        let world = World::new();
+        let a = world.spawn();
+        let b = world.spawn();
+        let c = world.spawn();
+        world.insert(a, Transform { translation: [1.0, 0.0, 0.0], ..Default::default() });
+        world.insert(b, Transform { translation: [2.0, 0.0, 0.0], ..Default::default() });
+        world.insert(c, Transform { translation: [3.0, 0.0, 0.0], ..Default::default() });
+        world.despawn(b);
+        assert!(world.get::<Transform>(b).is_none());
+        assert_eq!(world.get::<Transform>(a).expect("a").translation[0], 1.0);
+        assert_eq!(world.get::<Transform>(c).expect("c").translation[0], 3.0);
+        assert_eq!(world.count::<Transform>(), 2);
+    }
+
+    #[test]
+    fn event_bus_drains_matching_type_only() {
+        let bus = EventBus::default();
+        bus.push(7u32);
+        bus.push(String::from("hello"));
+        let ints = bus.drain::<u32>();
+        assert_eq!(ints, vec![7]);
+        // The string event remains for its own consumer.
+        assert_eq!(bus.drain::<String>(), vec!["hello".to_string()]);
     }
 }

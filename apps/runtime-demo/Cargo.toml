@@ -13,5 +13,6 @@ winit.workspace = true
 engine-assets = { path = "../../crates/engine-assets" }
 engine-core = { path = "../../crates/engine-core" }
 engine-ecs = { path = "../../crates/engine-ecs" }
+engine-physics = { path = "../../crates/engine-physics" }
 engine-render = { path = "../../crates/engine-render" }
 engine-scene = { path = "../../crates/engine-scene" }

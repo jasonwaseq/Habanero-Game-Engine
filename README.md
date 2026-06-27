@@ -45,16 +45,20 @@ The engine keeps long-lived ownership in `engine-core`, while frame-level packet
 
 ## Rendering Pipeline (current + target)
 
-Current foundation:
+Current foundation (implemented and running on Vulkan):
 
-- Camera abstraction (orthographic + perspective)
-- Scene extraction into draw packets
-- Render graph scaffold with passes:
-  - depth prepass
-  - gbuffer
-  - lighting
-  - transparent forward
-  - post process
+- Camera abstraction (orthographic + perspective + orbiting look-at)
+- Scene extraction into draw packets with per-instance color
+- Frustum culling against the camera view-projection
+- GPU-instanced draw of the extracted scene: per-instance model matrix + color
+  uploaded to a persistently-mapped vertex buffer, view-projection and light
+  direction supplied via push constants
+- Directional lighting with depth test/write into the G-buffer + present target
+- Dynamic viewport/scissor and full swapchain recreation on window resize
+- Discrete/integrated GPU selection that is safe on hybrid-graphics laptops
+- Render graph scaffold describing the deferred pass order:
+  - depth prepass, gbuffer, lighting, shadow map, ssao, bloom,
+    transparent forward, post process
 
 Target expansion:
 
@@ -89,29 +93,71 @@ See `docs/performance.md` for profiling and benchmark guidance.
 
 ```bash
 cargo check
-cargo test
-cargo run -p runtime-demo
-cargo run -p runtime-demo -- --stress=50000
+cargo test                                   # 24 tests across all crates
+
+# Interactive windowed demo (Vulkan on by default).
+# Recommended in release for a smooth, high-FPS flythrough:
+cargo run --release -p runtime-demo
+cargo run --release -p runtime-demo -- --stress=50000
+
+# Headless / reproducible benchmark (no window, writes a perf report CSV):
+cargo run --release -p runtime-demo -- --no-vulkan --frames=600 --stress=20000
+
 cargo run -p editor-app
 ```
 
+Runtime demo flags:
+
+- `--stress=<N>`  number of animated entities (default 12000, capped at 200000)
+- `--frames=<N>`  render N frames, print a p50/p95/p99 report, write
+  `assets/processed/perf_report.csv`, then exit (great for CI/benchmarks)
+- `--no-vulkan`   force the CPU/headless path (no GPU presentation)
+
+Optional Vulkan debug env vars (debug builds): `HBN_ENABLE_VALIDATION_CALLBACK=1`
+routes validation messages to the tracing log, `HBN_ENABLE_DEBUG_LABELS=1` adds
+GPU command labels for RenderDoc/Nsight captures.
+
+## Demo
+
+The runtime demo renders an animated "galaxy": thousands of GPU-instanced, lit
+cubes arranged in concentric rings plus a central rising helix. Every entity is
+driven by the ECS each frame — `Spin` rotates orientation, `Orbit` revolves the
+ring about the world axis — while an automatic camera orbits the scene. The title
+bar reports live telemetry:
+
+```
+Habanero [Vulkan] | 84 FPS | 11.9 ms (p50 11.9 / p99 18.7) | entities 20000 | visible 15792 | culled 21.0%
+```
+
+This single scene exercises ECS scale, multithreaded simulation, frustum
+culling, GPU instancing, directional lighting, and live profiling at once.
+
 ## Demo Targets
 
-- 2D sprite batching stress scene
-- 3D lit scene baseline
-- ECS throughput stress test
-- Asset hot reload loop for shaders/textures
-- Runtime live perf metrics (FPS/frame ms/entity count/draw calls/culling ratio in title bar)
+- Animated instanced 3D scene (`runtime-demo`) with live perf metrics
+- ECS throughput stress test (`cargo run -p runtime-demo --bin ecs_stress`)
+- 3D scene baseline (`cargo run -p runtime-demo --bin scene3d_demo`)
+- 2D sprite batch (`cargo run -p runtime-demo --bin sprite_demo`)
+- Asset hot reload loop (`cargo run -p runtime-demo --bin hot_reload_demo`)
 
 ## Next Implementation Steps
 
-- **Deferred lighting completion**: split G-buffer and lighting into separate subpasses/pipelines, sample G-buffer in lighting pass, and add directional light uniforms.
-- **Real scene draw path**: stream mesh vertex/index buffers, issue instanced draws from extracted render packets, and replace fullscreen debug draw as the primary pass.
+Recently completed:
+
+- **Real scene draw path** — GPU-instanced draws are issued from the extracted,
+  culled render packets (per-instance model + color), replacing the fullscreen
+  debug pass as the primary path (the fullscreen pass remains as a safe fallback).
+- **Performance instrumentation** — p50/p95/p99 frame-time percentiles plus
+  reproducible CSV capture (`--frames` benchmark mode).
+- **Robust demo scenario** — automated camera flythrough, configurable entity
+  presets, swapchain-resize resilience, and a reproducible performance report.
+
+Still ahead:
+
+- **Deferred lighting completion**: split G-buffer and lighting into separate subpasses/pipelines, sample G-buffer in lighting pass, and add multi-light support.
 - **GPU resource system**: add per-frame descriptor set ring, transient attachment allocator, and pipeline cache serialization.
 - **Render graph execution**: move pass order/resources from hardcoded sequence to explicit graph nodes and dependencies.
-- **Performance instrumentation**: add CPU/GPU frame timelines, percentile stats (p50/p95/p99), and CSV capture for benchmark runs.
 - **Scalable ECS queries**: add multi-component query joins and system dependency graph with conflict detection.
-- **Robust demo scenario**: ship fixed benchmark presets (10k/50k/100k entities), automated camera flythrough, and reproducible performance report output.
 
 ## Resume-Worthy Scope
 

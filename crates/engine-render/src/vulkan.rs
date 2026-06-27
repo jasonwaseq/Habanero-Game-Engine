@@ -6,9 +6,38 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use anyhow::{anyhow, Context, Result};
 use ash::{vk, Entry};
 use engine_assets::{MeshAsset, MeshVertex};
+use glam::Mat4;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use winit::window::Window;
-use crate::{MeshId, RenderWorld};
+use crate::{DrawPacket, RenderWorld};
+
+/// Per-instance data uploaded to the GPU each frame for instanced drawing.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct InstanceData {
+    /// Column-major model matrix.
+    model: [f32; 16],
+    color: [f32; 4],
+}
+
+/// Push constant block shared by the scene pipeline's vertex + fragment stages.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct ScenePush {
+    view_proj: [f32; 16],
+    light_dir: [f32; 4],
+}
+
+const MAX_INSTANCES: usize = 200_000;
+
+/// Swapchain plus its derived image views and chosen format/extent.
+type SwapchainBundle = (
+    vk::SwapchainKHR,
+    Vec<vk::Image>,
+    Vec<vk::ImageView>,
+    vk::Format,
+    vk::Extent2D,
+);
 
 pub struct DescriptorAllocator {
     device: Arc<ash::Device>,
@@ -84,7 +113,7 @@ struct FullscreenPipeline {
     pipeline: vk::Pipeline,
 }
 
-struct MeshPipeline {
+struct ScenePipeline {
     layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
 }
@@ -94,21 +123,27 @@ struct BufferResource {
     memory: vk::DeviceMemory,
 }
 
+/// A host-visible buffer that stays mapped for the lifetime of the backend.
+struct MappedBuffer {
+    resource: BufferResource,
+    ptr: *mut u8,
+    /// Total mapped size in bytes; used to bound per-frame instance writes.
+    size: usize,
+}
+
 struct GpuMesh {
     vertex: BufferResource,
     index: BufferResource,
+    #[allow(dead_code)]
     vertex_count: u32,
     index_count: u32,
 }
 
-#[derive(Debug, Clone, Copy)]
-enum MeshDrawMode {
-    BindOnly,
-    DrawNonIndexed,
-    DrawIndexed,
-}
-
 pub struct VulkanBackend {
+    // Keep the loader library (`vulkan-1.dll`) alive for the backend's lifetime.
+    // Dropping the `Entry` unloads it, which invalidates loader-dispatched
+    // instance-level functions such as the WSI surface queries.
+    _entry: Entry,
     instance: ash::Instance,
     debug_utils_instance: Option<ash::ext::debug_utils::Instance>,
     debug_messenger: Option<vk::DebugUtilsMessengerEXT>,
@@ -125,12 +160,15 @@ pub struct VulkanBackend {
     physical_device: vk::PhysicalDevice,
     graphics_queue: vk::Queue,
     graphics_queue_family: u32,
-    descriptor_allocator: DescriptorAllocator,
+    // `Option` so we can drop it (destroying its pool) while the device is still
+    // alive, before `Drop` tears down the device.
+    descriptor_allocator: Option<DescriptorAllocator>,
     gbuffer: GBuffer,
     gbuffer_render_pass: vk::RenderPass,
     fullscreen_pipeline: FullscreenPipeline,
-    mesh_pipeline: Option<MeshPipeline>,
-    gpu_meshes: std::collections::HashMap<MeshId, GpuMesh>,
+    scene_pipeline: ScenePipeline,
+    cube: GpuMesh,
+    instance_buffer: MappedBuffer,
     framebuffers: Vec<vk::Framebuffer>,
     command_pool: vk::CommandPool,
     command_buffers: Vec<vk::CommandBuffer>,
@@ -138,8 +176,6 @@ pub struct VulkanBackend {
     render_finished: vk::Semaphore,
     in_flight: vk::Fence,
     frame_counter: AtomicU64,
-    mesh_draw_enabled: bool,
-    mesh_draw_mode: MeshDrawMode,
     debug_labels_enabled: bool,
 }
 
@@ -226,11 +262,6 @@ impl VulkanBackend {
         } else {
             None
         };
-        if cfg!(debug_assertions) && has_validation_layer && !enable_validation_callback {
-            tracing::warn!(
-                "validation callback disabled by default; set HBN_ENABLE_VALIDATION_CALLBACK=1 to enable Vulkan debug messenger output"
-            );
-        }
 
         let window_handle = window
             .window_handle()
@@ -267,11 +298,6 @@ impl VulkanBackend {
         } else {
             None
         };
-        if has_debug_utils_ext && !debug_labels_enabled {
-            tracing::warn!(
-                "debug command labels disabled by default; set HBN_ENABLE_DEBUG_LABELS=1 to enable GPU command labels"
-            );
-        }
         let graphics_queue = unsafe { device.get_device_queue(graphics_queue_family, 0) };
 
         let swapchain_loader = ash::khr::swapchain::Device::new(&instance, &device);
@@ -286,28 +312,24 @@ impl VulkanBackend {
             window.inner_size().height.max(1),
         )?;
 
-        let mesh_draw_enabled =
-            std::env::var("HBN_ENABLE_MESH_DRAW").ok().as_deref() == Some("1");
-        let mesh_draw_mode = match std::env::var("HBN_MESH_DRAW_MODE")
-            .ok()
-            .as_deref()
-            .unwrap_or("draw_indexed")
-        {
-            "bind_only" => MeshDrawMode::BindOnly,
-            "draw_non_indexed" => MeshDrawMode::DrawNonIndexed,
-            _ => MeshDrawMode::DrawIndexed,
-        };
         let descriptor_allocator = DescriptorAllocator::new(device.clone())?;
         warmup_descriptor_allocator(&device, &descriptor_allocator)?;
         let gbuffer = create_gbuffer(&instance, &device, physical_device, extent)?;
         let gbuffer_render_pass = create_gbuffer_render_pass(&device, swapchain_format)?;
-        let fullscreen_pipeline =
-            create_fullscreen_pipeline(&device, gbuffer_render_pass, extent)?;
-        let mesh_pipeline = if mesh_draw_enabled {
-            Some(create_mesh_pipeline(&device, gbuffer_render_pass, extent)?)
-        } else {
-            None
-        };
+        let fullscreen_pipeline = create_fullscreen_pipeline(&device, gbuffer_render_pass)?;
+        let scene_pipeline = create_scene_pipeline(&device, gbuffer_render_pass)?;
+
+        let cube_asset = unit_cube_mesh();
+        let cube = upload_mesh(&instance, &device, physical_device, &cube_asset)?;
+
+        let instance_buffer = create_mapped_buffer(
+            &instance,
+            &device,
+            physical_device,
+            MAX_INSTANCES * size_of::<InstanceData>(),
+            vk::BufferUsageFlags::VERTEX_BUFFER,
+        )?;
+
         let framebuffers = create_framebuffers(
             &device,
             gbuffer_render_pass,
@@ -332,13 +354,8 @@ impl VulkanBackend {
         let fence_info = vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED);
         let in_flight = unsafe { device.create_fence(&fence_info, None) }?;
 
-        if !mesh_draw_enabled {
-            tracing::warn!(
-                "mesh indexed draw path disabled by default; set HBN_ENABLE_MESH_DRAW=1 to enable experimental path"
-            );
-        }
-
         Ok(Self {
+            _entry: entry,
             instance,
             debug_utils_instance,
             debug_messenger,
@@ -355,12 +372,13 @@ impl VulkanBackend {
             physical_device,
             graphics_queue,
             graphics_queue_family,
-            descriptor_allocator,
+            descriptor_allocator: Some(descriptor_allocator),
             gbuffer,
             gbuffer_render_pass,
             fullscreen_pipeline,
-            mesh_pipeline,
-            gpu_meshes: std::collections::HashMap::new(),
+            scene_pipeline,
+            cube,
+            instance_buffer,
             framebuffers,
             command_pool,
             command_buffers,
@@ -368,83 +386,81 @@ impl VulkanBackend {
             render_finished,
             in_flight,
             frame_counter: AtomicU64::new(0),
-            mesh_draw_enabled,
-            mesh_draw_mode,
             debug_labels_enabled,
         })
     }
 
-    pub fn upload_mesh(&mut self, mesh_id: MeshId, mesh: &MeshAsset) -> Result<()> {
-        if self.gpu_meshes.contains_key(&mesh_id) {
-            return Ok(());
-        }
-        if mesh.vertices.is_empty() {
-            return Err(anyhow!("mesh {} has no vertices", mesh.name));
-        }
-        if mesh.indices.is_empty() {
-            return Err(anyhow!("mesh {} has no indices", mesh.name));
-        }
-        if let Some(max_index) = mesh.indices.iter().max().copied() {
-            if max_index as usize >= mesh.vertices.len() {
-                return Err(anyhow!(
-                    "mesh {} has out-of-range index {} for {} vertices",
-                    mesh.name,
-                    max_index,
-                    mesh.vertices.len()
-                ));
-            }
-        }
-        let vertex = create_buffer_with_data(
-            &self.instance,
-            &self.device,
-            self.physical_device,
-            as_u8_slice(&mesh.vertices),
-            vk::BufferUsageFlags::VERTEX_BUFFER,
-        )?;
-        let index = create_buffer_with_data(
-            &self.instance,
-            &self.device,
-            self.physical_device,
-            as_u8_slice(&mesh.indices),
-            vk::BufferUsageFlags::INDEX_BUFFER,
-        )?;
-        self.gpu_meshes.insert(
-            mesh_id,
-            GpuMesh {
-                vertex,
-                index,
-                vertex_count: mesh.vertices.len() as u32,
-                index_count: mesh.indices.len() as u32,
-            },
-        );
+    /// External mesh uploads are accepted but the demo renders the resident cube.
+    pub fn upload_mesh(&mut self, _mesh_id: crate::MeshId, _mesh: &MeshAsset) -> Result<()> {
         Ok(())
     }
 
-    pub fn render_gbuffer_frame(&self, render_world: &RenderWorld) -> Result<()> {
-        let _ = self.swapchain_images.len();
-        let _ = self.swapchain_format;
-        let _ = self.physical_device;
-        let _ = self.graphics_queue_family;
-        let _ = &self.descriptor_allocator;
+    fn write_instances(&mut self, packets: &[DrawPacket]) -> u32 {
+        let capacity = self.instance_buffer.size / size_of::<InstanceData>();
+        let count = packets.len().min(capacity);
+        // SAFETY: `instance_buffer.ptr` is a persistently-mapped, host-coherent
+        // allocation of `instance_buffer.size` bytes; we never write past it.
+        unsafe {
+            let dst = self.instance_buffer.ptr.cast::<InstanceData>();
+            for (i, packet) in packets.iter().take(count).enumerate() {
+                let data = InstanceData {
+                    model: packet.model.to_cols_array(),
+                    color: packet.color,
+                };
+                std::ptr::write(dst.add(i), data);
+            }
+        }
+        count as u32
+    }
+
+    pub fn render_frame(
+        &mut self,
+        render_world: &RenderWorld,
+        view_proj: Mat4,
+        light_dir: glam::Vec3,
+    ) -> Result<()> {
+        if self.extent.width == 0 || self.extent.height == 0 {
+            return Ok(());
+        }
+        // Descriptor pool is warmed at init and reserved for upcoming
+        // per-frame uniform/material sets.
+        let _ = self.descriptor_allocator.as_ref();
+        let instance_count = self.write_instances(&render_world.draw_packets);
         let frame = self.frame_counter.fetch_add(1, Ordering::Relaxed) as f32;
         let t = frame * 0.02;
-        let present_r = (t.sin() * 0.5 + 0.5).clamp(0.0, 1.0);
-        let present_g = ((t + 2.094).sin() * 0.5 + 0.5).clamp(0.0, 1.0);
-        let present_b = ((t + 4.188).sin() * 0.5 + 0.5).clamp(0.0, 1.0);
+        let bg_r = (0.02 + 0.015 * (t * 0.5).sin().abs()).clamp(0.0, 1.0);
+        let bg_g = (0.02 + 0.02 * (t * 0.37).sin().abs()).clamp(0.0, 1.0);
+        let bg_b = (0.05 + 0.05 * (t * 0.23).sin().abs()).clamp(0.0, 1.0);
 
         unsafe {
             self.device
                 .wait_for_fences(&[self.in_flight], true, u64::MAX)?;
-            self.device.reset_fences(&[self.in_flight])?;
         }
-        let (image_index, _) = unsafe {
+        let acquire = unsafe {
             self.swapchain_loader.acquire_next_image(
                 self.swapchain,
                 u64::MAX,
                 self.image_available,
                 vk::Fence::null(),
             )
-        }?;
+        };
+        let image_index = match acquire {
+            Ok((index, _suboptimal)) => index,
+            Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
+                self.recreate_swapchain()?;
+                return Ok(());
+            }
+            Err(err) => return Err(err.into()),
+        };
+
+        unsafe {
+            self.device.reset_fences(&[self.in_flight])?;
+        }
+
+        let push = ScenePush {
+            view_proj: view_proj.to_cols_array(),
+            light_dir: [light_dir.x, light_dir.y, light_dir.z, 0.0],
+        };
 
         let command_buffer = self.command_buffers[image_index as usize];
         unsafe {
@@ -453,12 +469,12 @@ impl VulkanBackend {
             let begin_info = vk::CommandBufferBeginInfo::default();
             self.device.begin_command_buffer(command_buffer, &begin_info)?;
             if self.debug_labels_enabled {
-                begin_label(self.debug_utils_device.as_ref(), command_buffer, c"gbuffer_frame");
+                begin_label(self.debug_utils_device.as_ref(), command_buffer, c"scene_frame");
             }
             let clear_values = [
                 vk::ClearValue {
                     color: vk::ClearColorValue {
-                        float32: [0.03, 0.03, 0.04, 1.0],
+                        float32: [0.0, 0.0, 0.0, 1.0],
                     },
                 },
                 vk::ClearValue {
@@ -468,7 +484,7 @@ impl VulkanBackend {
                 },
                 vk::ClearValue {
                     color: vk::ClearColorValue {
-                        float32: [0.5, 0.5, 0.0, 1.0],
+                        float32: [0.0, 0.5, 0.0, 1.0],
                     },
                 },
                 vk::ClearValue {
@@ -479,7 +495,7 @@ impl VulkanBackend {
                 },
                 vk::ClearValue {
                     color: vk::ClearColorValue {
-                        float32: [present_r, present_g, present_b, 1.0],
+                        float32: [bg_r, bg_g, bg_b, 1.0],
                     },
                 },
             ];
@@ -496,73 +512,68 @@ impl VulkanBackend {
                 &render_pass_info,
                 vk::SubpassContents::INLINE,
             );
-            if self.debug_labels_enabled {
-                begin_label(
-                    self.debug_utils_device.as_ref(),
+
+            let viewport = vk::Viewport {
+                x: 0.0,
+                y: 0.0,
+                width: self.extent.width as f32,
+                height: self.extent.height as f32,
+                min_depth: 0.0,
+                max_depth: 1.0,
+            };
+            let scissor = vk::Rect2D {
+                offset: vk::Offset2D { x: 0, y: 0 },
+                extent: self.extent,
+            };
+            self.device.cmd_set_viewport(command_buffer, 0, &[viewport]);
+            self.device.cmd_set_scissor(command_buffer, 0, &[scissor]);
+
+            if instance_count > 0 {
+                if self.debug_labels_enabled {
+                    begin_label(
+                        self.debug_utils_device.as_ref(),
+                        command_buffer,
+                        c"instanced_scene",
+                    );
+                }
+                self.device.cmd_bind_pipeline(
                     command_buffer,
-                    c"mesh_or_fullscreen_pass",
+                    vk::PipelineBindPoint::GRAPHICS,
+                    self.scene_pipeline.pipeline,
                 );
-            }
-            let mut drew_mesh = false;
-            if self.mesh_draw_enabled {
-                if let Some(mesh_pipeline) = self.mesh_pipeline.as_ref() {
-                    self.device.cmd_bind_pipeline(
-                        command_buffer,
-                        vk::PipelineBindPoint::GRAPHICS,
-                        mesh_pipeline.pipeline,
-                    );
+                let vertex_buffers = [self.cube.vertex.buffer, self.instance_buffer.resource.buffer];
+                let offsets = [0_u64, 0_u64];
+                self.device
+                    .cmd_bind_vertex_buffers(command_buffer, 0, &vertex_buffers, &offsets);
+                self.device.cmd_bind_index_buffer(
+                    command_buffer,
+                    self.cube.index.buffer,
+                    0,
+                    vk::IndexType::UINT32,
+                );
+                let push_bytes = std::slice::from_raw_parts(
+                    (&push as *const ScenePush).cast::<u8>(),
+                    size_of::<ScenePush>(),
+                );
+                self.device.cmd_push_constants(
+                    command_buffer,
+                    self.scene_pipeline.layout,
+                    vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                    0,
+                    push_bytes,
+                );
+                self.device.cmd_draw_indexed(
+                    command_buffer,
+                    self.cube.index_count,
+                    instance_count,
+                    0,
+                    0,
+                    0,
+                );
+                if self.debug_labels_enabled {
+                    end_label(self.debug_utils_device.as_ref(), command_buffer);
                 }
-                let mut mesh_instance_counts: std::collections::HashMap<MeshId, u32> =
-                    std::collections::HashMap::new();
-                for draw in &render_world.draw_packets {
-                    *mesh_instance_counts.entry(draw.mesh).or_insert(0) += 1;
-                }
-                for (mesh_id, instance_count) in mesh_instance_counts {
-                    let Some(mesh) = self.gpu_meshes.get(&mesh_id) else {
-                        continue;
-                    };
-                    if mesh.index_count == 0 {
-                        continue;
-                    }
-                    let vertex_buffers = [mesh.vertex.buffer];
-                    let offsets = [0_u64];
-                    self.device
-                        .cmd_bind_vertex_buffers(command_buffer, 0, &vertex_buffers, &offsets);
-                    self.device.cmd_bind_index_buffer(
-                        command_buffer,
-                        mesh.index.buffer,
-                        0,
-                        vk::IndexType::UINT32,
-                    );
-                    match self.mesh_draw_mode {
-                        MeshDrawMode::BindOnly => {
-                            tracing::debug!(mesh_id = mesh_id.0, "mesh pipeline bind-only mode");
-                        }
-                        MeshDrawMode::DrawNonIndexed => {
-                            self.device.cmd_draw(
-                                command_buffer,
-                                mesh.vertex_count.max(3),
-                                instance_count.max(1),
-                                0,
-                                0,
-                            );
-                            drew_mesh = true;
-                        }
-                        MeshDrawMode::DrawIndexed => {
-                            self.device.cmd_draw_indexed(
-                                command_buffer,
-                                mesh.index_count,
-                                instance_count.max(1),
-                                0,
-                                0,
-                                0,
-                            );
-                            drew_mesh = true;
-                        }
-                    }
-                }
-            }
-            if !drew_mesh {
+            } else {
                 self.device.cmd_bind_pipeline(
                     command_buffer,
                     vk::PipelineBindPoint::GRAPHICS,
@@ -570,9 +581,7 @@ impl VulkanBackend {
                 );
                 self.device.cmd_draw(command_buffer, 3, 1, 0, 0);
             }
-            if self.debug_labels_enabled {
-                end_label(self.debug_utils_device.as_ref(), command_buffer);
-            }
+
             self.device.cmd_end_render_pass(command_buffer);
             if self.debug_labels_enabled {
                 end_label(self.debug_utils_device.as_ref(), command_buffer);
@@ -598,8 +607,88 @@ impl VulkanBackend {
                 .wait_semaphores(&present_wait)
                 .swapchains(&present_swaps)
                 .image_indices(&present_indices);
-            self.swapchain_loader
-                .queue_present(self.graphics_queue, &present_info)?;
+            match self
+                .swapchain_loader
+                .queue_present(self.graphics_queue, &present_info)
+            {
+                Ok(_) => {}
+                Err(vk::Result::ERROR_OUT_OF_DATE_KHR) | Err(vk::Result::SUBOPTIMAL_KHR) => {
+                    self.recreate_swapchain()?;
+                }
+                Err(err) => return Err(err.into()),
+            }
+        }
+        Ok(())
+    }
+
+    /// Recreate the swapchain and all size-dependent attachments after a resize
+    /// or an out-of-date surface. Pipelines use dynamic viewport/scissor, so they
+    /// survive resizes untouched.
+    pub fn recreate_swapchain(&mut self) -> Result<()> {
+        let capabilities = unsafe {
+            self.surface_loader
+                .get_physical_device_surface_capabilities(self.physical_device, self.surface)?
+        };
+        let new_extent = if capabilities.current_extent.width != u32::MAX {
+            capabilities.current_extent
+        } else {
+            self.extent
+        };
+        if new_extent.width == 0 || new_extent.height == 0 {
+            // Minimized: keep resources, skip rendering until restored.
+            self.extent = new_extent;
+            return Ok(());
+        }
+
+        unsafe {
+            self.device.device_wait_idle()?;
+            for framebuffer in self.framebuffers.drain(..) {
+                self.device.destroy_framebuffer(framebuffer, None);
+            }
+            destroy_image_resource(&self.device, &self.gbuffer.albedo);
+            destroy_image_resource(&self.device, &self.gbuffer.normals);
+            destroy_image_resource(&self.device, &self.gbuffer.material);
+            destroy_image_resource(&self.device, &self.gbuffer.depth);
+            for view in self.swapchain_views.drain(..) {
+                self.device.destroy_image_view(view, None);
+            }
+            self.swapchain_loader.destroy_swapchain(self.swapchain, None);
+        }
+
+        let (swapchain, images, views, format, extent) = create_swapchain(
+            &self.device,
+            &self.surface_loader,
+            &self.swapchain_loader,
+            self.physical_device,
+            self.surface,
+            self.graphics_queue_family,
+            new_extent.width,
+            new_extent.height,
+        )?;
+        self.swapchain = swapchain;
+        self.swapchain_images = images;
+        self.swapchain_views = views;
+        self.swapchain_format = format;
+        self.extent = extent;
+        self.gbuffer = create_gbuffer(&self.instance, &self.device, self.physical_device, extent)?;
+        self.framebuffers = create_framebuffers(
+            &self.device,
+            self.gbuffer_render_pass,
+            &self.swapchain_views,
+            &self.gbuffer,
+            extent,
+        )?;
+        // Keep one command buffer per swapchain image if the count changed.
+        if self.framebuffers.len() != self.command_buffers.len() {
+            unsafe {
+                self.device
+                    .free_command_buffers(self.command_pool, &self.command_buffers);
+            }
+            let cmd_alloc = vk::CommandBufferAllocateInfo::default()
+                .command_pool(self.command_pool)
+                .command_buffer_count(self.framebuffers.len() as u32)
+                .level(vk::CommandBufferLevel::PRIMARY);
+            self.command_buffers = unsafe { self.device.allocate_command_buffers(&cmd_alloc) }?;
         }
         Ok(())
     }
@@ -617,6 +706,9 @@ impl Drop for VulkanBackend {
     fn drop(&mut self) {
         unsafe {
             let _ = self.device.device_wait_idle();
+            // Destroy the descriptor pool (via its own Drop) before we tear down
+            // the device it references.
+            self.descriptor_allocator.take();
             self.device.destroy_fence(self.in_flight, None);
             self.device.destroy_semaphore(self.render_finished, None);
             self.device.destroy_semaphore(self.image_available, None);
@@ -629,15 +721,15 @@ impl Drop for VulkanBackend {
                 .destroy_pipeline(self.fullscreen_pipeline.pipeline, None);
             self.device
                 .destroy_pipeline_layout(self.fullscreen_pipeline.layout, None);
-            if let Some(mesh_pipeline) = self.mesh_pipeline.as_ref() {
-                self.device.destroy_pipeline(mesh_pipeline.pipeline, None);
-                self.device
-                    .destroy_pipeline_layout(mesh_pipeline.layout, None);
-            }
-            for mesh in self.gpu_meshes.values() {
-                destroy_buffer_resource(&self.device, &mesh.vertex);
-                destroy_buffer_resource(&self.device, &mesh.index);
-            }
+            self.device.destroy_pipeline(self.scene_pipeline.pipeline, None);
+            self.device
+                .destroy_pipeline_layout(self.scene_pipeline.layout, None);
+
+            destroy_buffer_resource(&self.device, &self.cube.vertex);
+            destroy_buffer_resource(&self.device, &self.cube.index);
+            self.device
+                .unmap_memory(self.instance_buffer.resource.memory);
+            destroy_buffer_resource(&self.device, &self.instance_buffer.resource);
 
             destroy_image_resource(&self.device, &self.gbuffer.albedo);
             destroy_image_resource(&self.device, &self.gbuffer.normals);
@@ -666,11 +758,14 @@ fn pick_physical_device(
     surface: vk::SurfaceKHR,
 ) -> Result<(vk::PhysicalDevice, u32)> {
     let devices = unsafe { instance.enumerate_physical_devices() }?;
+    // Pick the first device/queue family that supports both graphics and present
+    // for this surface. On hybrid-graphics systems this is the GPU the surface
+    // was created against, which avoids cross-ICD surface query faults.
     for physical_device in devices {
         let queue_props =
             unsafe { instance.get_physical_device_queue_family_properties(physical_device) };
-        for (index, props) in queue_props.iter().enumerate() {
-            let supports_graphics = props.queue_flags.contains(vk::QueueFlags::GRAPHICS);
+        for (index, family) in queue_props.iter().enumerate() {
+            let supports_graphics = family.queue_flags.contains(vk::QueueFlags::GRAPHICS);
             let supports_present = unsafe {
                 surface_loader.get_physical_device_surface_support(
                     physical_device,
@@ -686,6 +781,7 @@ fn pick_physical_device(
     Err(anyhow!("no suitable Vulkan physical device with present support"))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn create_swapchain(
     device: &ash::Device,
     surface_loader: &ash::khr::surface::Instance,
@@ -695,13 +791,7 @@ fn create_swapchain(
     queue_family: u32,
     width: u32,
     height: u32,
-) -> Result<(
-    vk::SwapchainKHR,
-    Vec<vk::Image>,
-    Vec<vk::ImageView>,
-    vk::Format,
-    vk::Extent2D,
-)> {
+) -> Result<SwapchainBundle> {
     let capabilities =
         unsafe { surface_loader.get_physical_device_surface_capabilities(physical_device, surface) }?;
     let formats =
@@ -730,15 +820,19 @@ fn create_swapchain(
         image_count = image_count.min(capabilities.max_image_count);
     }
 
-    let extent = vk::Extent2D {
-        width: width.clamp(
-            capabilities.min_image_extent.width,
-            capabilities.max_image_extent.width,
-        ),
-        height: height.clamp(
-            capabilities.min_image_extent.height,
-            capabilities.max_image_extent.height,
-        ),
+    let extent = if capabilities.current_extent.width != u32::MAX {
+        capabilities.current_extent
+    } else {
+        vk::Extent2D {
+            width: width.clamp(
+                capabilities.min_image_extent.width,
+                capabilities.max_image_extent.width,
+            ),
+            height: height.clamp(
+                capabilities.min_image_extent.height,
+                capabilities.max_image_extent.height,
+            ),
+        }
     };
 
     let queue_families = [queue_family];
@@ -962,9 +1056,18 @@ fn create_gbuffer_render_pass(device: &ash::Device, swapchain_format: vk::Format
     let dependency = vk::SubpassDependency::default()
         .src_subpass(vk::SUBPASS_EXTERNAL)
         .dst_subpass(0)
-        .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
-        .dst_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
-        .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE);
+        .src_stage_mask(
+            vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
+                | vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS,
+        )
+        .dst_stage_mask(
+            vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
+                | vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS,
+        )
+        .dst_access_mask(
+            vk::AccessFlags::COLOR_ATTACHMENT_WRITE
+                | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
+        );
     let subpasses = [subpass];
     let dependencies = [dependency];
     let pass_info = vk::RenderPassCreateInfo::default()
@@ -1042,7 +1145,7 @@ fn create_buffer_with_data(
     usage: vk::BufferUsageFlags,
 ) -> Result<BufferResource> {
     let buffer_info = vk::BufferCreateInfo::default()
-        .size(data.len() as u64)
+        .size(data.len().max(1) as u64)
         .usage(usage)
         .sharing_mode(vk::SharingMode::EXCLUSIVE);
     let buffer = unsafe { device.create_buffer(&buffer_info, None) }?;
@@ -1067,6 +1170,103 @@ fn create_buffer_with_data(
     Ok(BufferResource { buffer, memory })
 }
 
+fn create_mapped_buffer(
+    instance: &ash::Instance,
+    device: &ash::Device,
+    physical_device: vk::PhysicalDevice,
+    size: usize,
+    usage: vk::BufferUsageFlags,
+) -> Result<MappedBuffer> {
+    let buffer_info = vk::BufferCreateInfo::default()
+        .size(size as u64)
+        .usage(usage)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE);
+    let buffer = unsafe { device.create_buffer(&buffer_info, None) }?;
+    let requirements = unsafe { device.get_buffer_memory_requirements(buffer) };
+    let mem_type = find_memory_type(
+        instance,
+        physical_device,
+        requirements.memory_type_bits,
+        vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+    )
+    .ok_or_else(|| anyhow!("unable to find host visible memory for mapped buffer"))?;
+    let alloc_info = vk::MemoryAllocateInfo::default()
+        .allocation_size(requirements.size)
+        .memory_type_index(mem_type);
+    let memory = unsafe { device.allocate_memory(&alloc_info, None) }?;
+    let ptr = unsafe {
+        device.bind_buffer_memory(buffer, memory, 0)?;
+        device.map_memory(memory, 0, size as u64, vk::MemoryMapFlags::empty())?
+    };
+    Ok(MappedBuffer {
+        resource: BufferResource { buffer, memory },
+        ptr: ptr.cast::<u8>(),
+        size,
+    })
+}
+
+fn upload_mesh(
+    instance: &ash::Instance,
+    device: &ash::Device,
+    physical_device: vk::PhysicalDevice,
+    mesh: &MeshAsset,
+) -> Result<GpuMesh> {
+    let vertex = create_buffer_with_data(
+        instance,
+        device,
+        physical_device,
+        as_u8_slice(&mesh.vertices),
+        vk::BufferUsageFlags::VERTEX_BUFFER,
+    )?;
+    let index = create_buffer_with_data(
+        instance,
+        device,
+        physical_device,
+        as_u8_slice(&mesh.indices),
+        vk::BufferUsageFlags::INDEX_BUFFER,
+    )?;
+    Ok(GpuMesh {
+        vertex,
+        index,
+        vertex_count: mesh.vertices.len() as u32,
+        index_count: mesh.indices.len() as u32,
+    })
+}
+
+fn unit_cube_mesh() -> MeshAsset {
+    // (normal, v0, v1, v2, v3) per cube face.
+    type Face = ([f32; 3], [f32; 3], [f32; 3], [f32; 3], [f32; 3]);
+    // 24 vertices (4 per face) with per-face normals so lighting reads cleanly.
+    let faces: [Face; 6] = [
+        // (normal, v0, v1, v2, v3) wound CCW when viewed from outside
+        ([0.0, 0.0, 1.0], [-0.5, -0.5, 0.5], [0.5, -0.5, 0.5], [0.5, 0.5, 0.5], [-0.5, 0.5, 0.5]),
+        ([0.0, 0.0, -1.0], [0.5, -0.5, -0.5], [-0.5, -0.5, -0.5], [-0.5, 0.5, -0.5], [0.5, 0.5, -0.5]),
+        ([1.0, 0.0, 0.0], [0.5, -0.5, 0.5], [0.5, -0.5, -0.5], [0.5, 0.5, -0.5], [0.5, 0.5, 0.5]),
+        ([-1.0, 0.0, 0.0], [-0.5, -0.5, -0.5], [-0.5, -0.5, 0.5], [-0.5, 0.5, 0.5], [-0.5, 0.5, -0.5]),
+        ([0.0, 1.0, 0.0], [-0.5, 0.5, 0.5], [0.5, 0.5, 0.5], [0.5, 0.5, -0.5], [-0.5, 0.5, -0.5]),
+        ([0.0, -1.0, 0.0], [-0.5, -0.5, -0.5], [0.5, -0.5, -0.5], [0.5, -0.5, 0.5], [-0.5, -0.5, 0.5]),
+    ];
+    let uvs = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+    let mut vertices = Vec::with_capacity(24);
+    let mut indices = Vec::with_capacity(36);
+    for (face_idx, (normal, v0, v1, v2, v3)) in faces.iter().enumerate() {
+        let base = (face_idx * 4) as u32;
+        for (corner, pos) in [v0, v1, v2, v3].into_iter().enumerate() {
+            vertices.push(MeshVertex {
+                position: *pos,
+                normal: *normal,
+                uv: uvs[corner],
+            });
+        }
+        indices.extend_from_slice(&[base, base + 1, base + 2, base + 2, base + 3, base]);
+    }
+    MeshAsset {
+        name: "unit_cube".to_string(),
+        vertices,
+        indices,
+    }
+}
+
 fn warmup_descriptor_allocator(device: &ash::Device, allocator: &DescriptorAllocator) -> Result<()> {
     let binding = vk::DescriptorSetLayoutBinding::default()
         .binding(0)
@@ -1084,10 +1284,13 @@ fn warmup_descriptor_allocator(device: &ash::Device, allocator: &DescriptorAlloc
     Ok(())
 }
 
+fn dynamic_viewport_state() -> [vk::DynamicState; 2] {
+    [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR]
+}
+
 fn create_fullscreen_pipeline(
     device: &ash::Device,
     render_pass: vk::RenderPass,
-    extent: vk::Extent2D,
 ) -> Result<FullscreenPipeline> {
     let vert_spv = compile_shader(
         r#"
@@ -1125,12 +1328,11 @@ fn create_fullscreen_pipeline(
             @fragment
             fn main(@location(0) uv: vec2<f32>) -> FsOut {
                 var out: FsOut;
-                let wave = 0.5 + 0.5 * sin(uv.x * 9.0);
-                let base = vec3<f32>(uv.x, uv.y, wave);
-                out.outAlbedo = vec4<f32>(base, 1.0);
+                let g = mix(vec3<f32>(0.02, 0.03, 0.08), vec3<f32>(0.06, 0.02, 0.12), uv.y);
+                out.outAlbedo = vec4<f32>(g, 1.0);
                 out.outNormal = vec4<f32>(0.5, 0.5, 1.0, 1.0);
                 out.outMaterial = vec4<f32>(0.04, 0.7, 0.0, 1.0);
-                out.outPresent = vec4<f32>(base.z, base.y, base.x, 1.0);
+                out.outPresent = vec4<f32>(g, 1.0);
                 return out;
             }
         "#,
@@ -1156,30 +1358,19 @@ fn create_fullscreen_pipeline(
     let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
         .topology(vk::PrimitiveTopology::TRIANGLE_LIST)
         .primitive_restart_enable(false);
-    let viewport = vk::Viewport {
-        x: 0.0,
-        y: 0.0,
-        width: extent.width as f32,
-        height: extent.height as f32,
-        min_depth: 0.0,
-        max_depth: 1.0,
-    };
-    let scissor = vk::Rect2D {
-        offset: vk::Offset2D { x: 0, y: 0 },
-        extent,
-    };
-    let viewports = [viewport];
-    let scissors = [scissor];
     let viewport_state = vk::PipelineViewportStateCreateInfo::default()
-        .viewports(&viewports)
-        .scissors(&scissors);
+        .viewport_count(1)
+        .scissor_count(1);
+    let dynamic_states = dynamic_viewport_state();
+    let dynamic_state =
+        vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
     let raster = vk::PipelineRasterizationStateCreateInfo::default()
         .depth_clamp_enable(false)
         .rasterizer_discard_enable(false)
         .polygon_mode(vk::PolygonMode::FILL)
         .line_width(1.0)
         .cull_mode(vk::CullModeFlags::NONE)
-        .front_face(vk::FrontFace::CLOCKWISE);
+        .front_face(vk::FrontFace::COUNTER_CLOCKWISE);
     let multisample = vk::PipelineMultisampleStateCreateInfo::default()
         .rasterization_samples(vk::SampleCountFlags::TYPE_1);
     let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
@@ -1212,6 +1403,7 @@ fn create_fullscreen_pipeline(
         .vertex_input_state(&vertex_input)
         .input_assembly_state(&input_assembly)
         .viewport_state(&viewport_state)
+        .dynamic_state(&dynamic_state)
         .rasterization_state(&raster)
         .multisample_state(&multisample)
         .depth_stencil_state(&depth_stencil)
@@ -1234,17 +1426,22 @@ fn create_fullscreen_pipeline(
     })
 }
 
-fn create_mesh_pipeline(
+fn create_scene_pipeline(
     device: &ash::Device,
     render_pass: vk::RenderPass,
-    extent: vk::Extent2D,
-) -> Result<MeshPipeline> {
+) -> Result<ScenePipeline> {
     let vert_spv = compile_shader(
         r#"
+            struct PushConstants {
+                view_proj: mat4x4<f32>,
+                light_dir: vec4<f32>,
+            };
+            var<push_constant> pc: PushConstants;
+
             struct VsOut {
                 @builtin(position) pos: vec4<f32>,
-                @location(0) normal: vec3<f32>,
-                @location(1) uv: vec2<f32>,
+                @location(0) world_normal: vec3<f32>,
+                @location(1) color: vec4<f32>,
             };
 
             @vertex
@@ -1252,25 +1449,33 @@ fn create_mesh_pipeline(
                 @location(0) in_pos: vec3<f32>,
                 @location(1) in_normal: vec3<f32>,
                 @location(2) in_uv: vec2<f32>,
-                @builtin(instance_index) instance_idx: u32
+                @location(3) m0: vec4<f32>,
+                @location(4) m1: vec4<f32>,
+                @location(5) m2: vec4<f32>,
+                @location(6) m3: vec4<f32>,
+                @location(7) in_color: vec4<f32>
             ) -> VsOut {
+                let model = mat4x4<f32>(m0, m1, m2, m3);
+                let world = model * vec4<f32>(in_pos, 1.0);
                 var out: VsOut;
-                let grid: f32 = 128.0;
-                let x = f32(instance_idx % u32(grid));
-                let z = f32(instance_idx / u32(grid));
-                let offset = vec3<f32>((x - grid * 0.5) * 0.035, 0.0, z * 0.035);
-                let world = in_pos * 0.06 + offset;
-                out.pos = vec4<f32>(world.x, world.y, world.z * 0.5 + 0.1, 1.0);
-                out.normal = normalize(in_normal * 0.5 + vec3<f32>(0.5, 0.5, 0.5));
-                out.uv = in_uv;
+                out.pos = pc.view_proj * world;
+                let n = model * vec4<f32>(in_normal, 0.0);
+                out.world_normal = normalize(n.xyz);
+                out.color = in_color;
                 return out;
             }
         "#,
         ShaderStage::Vertex,
-        "mesh.vert",
+        "scene.vert",
     )?;
     let frag_spv = compile_shader(
         r#"
+            struct PushConstants {
+                view_proj: mat4x4<f32>,
+                light_dir: vec4<f32>,
+            };
+            var<push_constant> pc: PushConstants;
+
             struct FsOut {
                 @location(0) outAlbedo: vec4<f32>,
                 @location(1) outNormal: vec4<f32>,
@@ -1279,19 +1484,27 @@ fn create_mesh_pipeline(
             };
 
             @fragment
-            fn main(@location(0) normal: vec3<f32>, @location(1) uv: vec2<f32>) -> FsOut {
+            fn main(
+                @location(0) world_normal: vec3<f32>,
+                @location(1) color: vec4<f32>
+            ) -> FsOut {
+                let n = normalize(world_normal);
+                let l = normalize(pc.light_dir.xyz);
+                let ndotl = max(dot(n, -l), 0.0);
+                let ambient = 0.18;
+                let rim = pow(1.0 - max(n.z, 0.0), 2.0) * 0.15;
+                let lighting = ambient + ndotl * 0.9 + rim;
+                let lit = color.rgb * lighting;
                 var out: FsOut;
-                let lit = max(dot(normalize(normal * 2.0 - vec3<f32>(1.0, 1.0, 1.0)), normalize(vec3<f32>(0.2, 1.0, 0.3))), 0.12);
-                let albedo = vec3<f32>(uv.x, 0.35 + uv.y * 0.65, 0.95 - uv.x * 0.4);
-                out.outAlbedo = vec4<f32>(albedo, 1.0);
-                out.outNormal = vec4<f32>(normal, 1.0);
-                out.outMaterial = vec4<f32>(0.04, 0.65, 0.0, 1.0);
-                out.outPresent = vec4<f32>(albedo * lit, 1.0);
+                out.outAlbedo = vec4<f32>(color.rgb, 1.0);
+                out.outNormal = vec4<f32>(n * 0.5 + vec3<f32>(0.5, 0.5, 0.5), 1.0);
+                out.outMaterial = vec4<f32>(0.04, 0.6, 0.0, 1.0);
+                out.outPresent = vec4<f32>(lit, 1.0);
                 return out;
             }
         "#,
         ShaderStage::Fragment,
-        "mesh.frag",
+        "scene.frag",
     )?;
     let vert_module = create_shader_module(device, &vert_spv)?;
     let frag_module = create_shader_module(device, &frag_spv)?;
@@ -1307,11 +1520,18 @@ fn create_mesh_pipeline(
             .name(&entry_name),
     ];
 
-    let binding = vk::VertexInputBindingDescription::default()
-        .binding(0)
-        .stride(size_of::<MeshVertex>() as u32)
-        .input_rate(vk::VertexInputRate::VERTEX);
+    let bindings = [
+        vk::VertexInputBindingDescription::default()
+            .binding(0)
+            .stride(size_of::<MeshVertex>() as u32)
+            .input_rate(vk::VertexInputRate::VERTEX),
+        vk::VertexInputBindingDescription::default()
+            .binding(1)
+            .stride(size_of::<InstanceData>() as u32)
+            .input_rate(vk::VertexInputRate::INSTANCE),
+    ];
     let attrs = [
+        // per-vertex
         vk::VertexInputAttributeDescription::default()
             .binding(0)
             .location(0)
@@ -1327,30 +1547,45 @@ fn create_mesh_pipeline(
             .location(2)
             .format(vk::Format::R32G32_SFLOAT)
             .offset(24),
+        // per-instance model matrix columns
+        vk::VertexInputAttributeDescription::default()
+            .binding(1)
+            .location(3)
+            .format(vk::Format::R32G32B32A32_SFLOAT)
+            .offset(0),
+        vk::VertexInputAttributeDescription::default()
+            .binding(1)
+            .location(4)
+            .format(vk::Format::R32G32B32A32_SFLOAT)
+            .offset(16),
+        vk::VertexInputAttributeDescription::default()
+            .binding(1)
+            .location(5)
+            .format(vk::Format::R32G32B32A32_SFLOAT)
+            .offset(32),
+        vk::VertexInputAttributeDescription::default()
+            .binding(1)
+            .location(6)
+            .format(vk::Format::R32G32B32A32_SFLOAT)
+            .offset(48),
+        // per-instance color
+        vk::VertexInputAttributeDescription::default()
+            .binding(1)
+            .location(7)
+            .format(vk::Format::R32G32B32A32_SFLOAT)
+            .offset(64),
     ];
-    let bindings = [binding];
     let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
         .vertex_binding_descriptions(&bindings)
         .vertex_attribute_descriptions(&attrs);
     let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
         .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
-    let viewport = vk::Viewport {
-        x: 0.0,
-        y: 0.0,
-        width: extent.width as f32,
-        height: extent.height as f32,
-        min_depth: 0.0,
-        max_depth: 1.0,
-    };
-    let scissor = vk::Rect2D {
-        offset: vk::Offset2D { x: 0, y: 0 },
-        extent,
-    };
-    let viewports = [viewport];
-    let scissors = [scissor];
     let viewport_state = vk::PipelineViewportStateCreateInfo::default()
-        .viewports(&viewports)
-        .scissors(&scissors);
+        .viewport_count(1)
+        .scissor_count(1);
+    let dynamic_states = dynamic_viewport_state();
+    let dynamic_state =
+        vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
     let raster = vk::PipelineRasterizationStateCreateInfo::default()
         .polygon_mode(vk::PolygonMode::FILL)
         .line_width(1.0)
@@ -1373,12 +1608,18 @@ fn create_mesh_pipeline(
     let color_blend_attachments = [attachment, attachment, attachment, attachment];
     let color_blend =
         vk::PipelineColorBlendStateCreateInfo::default().attachments(&color_blend_attachments);
-    let layout = unsafe { device.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default(), None) }?;
+    let push_ranges = [vk::PushConstantRange::default()
+        .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
+        .offset(0)
+        .size(size_of::<ScenePush>() as u32)];
+    let layout_info = vk::PipelineLayoutCreateInfo::default().push_constant_ranges(&push_ranges);
+    let layout = unsafe { device.create_pipeline_layout(&layout_info, None) }?;
     let pipeline_info = vk::GraphicsPipelineCreateInfo::default()
         .stages(&stages)
         .vertex_input_state(&vertex_input)
         .input_assembly_state(&input_assembly)
         .viewport_state(&viewport_state)
+        .dynamic_state(&dynamic_state)
         .rasterization_state(&raster)
         .multisample_state(&multisample)
         .depth_stencil_state(&depth_stencil)
@@ -1389,12 +1630,12 @@ fn create_mesh_pipeline(
     let pipelines = unsafe {
         device.create_graphics_pipelines(vk::PipelineCache::null(), &[pipeline_info], None)
     }
-    .map_err(|(_, err)| anyhow!("failed to create mesh pipeline: {err:?}"))?;
+    .map_err(|(_, err)| anyhow!("failed to create scene pipeline: {err:?}"))?;
     unsafe {
         device.destroy_shader_module(vert_module, None);
         device.destroy_shader_module(frag_module, None);
     }
-    Ok(MeshPipeline {
+    Ok(ScenePipeline {
         layout,
         pipeline: pipelines[0],
     })

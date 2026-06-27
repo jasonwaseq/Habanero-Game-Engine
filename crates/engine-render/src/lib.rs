@@ -7,7 +7,7 @@ use anyhow::Result;
 use ash::vk;
 use engine_assets::MeshAsset;
 use engine_scene::Scene;
-use glam::{Mat4, Vec3A};
+use glam::{Mat4, Vec3, Vec3A};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use winit::window::Window;
@@ -42,11 +42,24 @@ impl Camera {
             ),
         }
     }
+
+    /// Build an orbiting look-at camera pointing at `target`.
+    pub fn looking_at(eye: Vec3, target: Vec3, aspect: f32, fov_y_radians: f32) -> Self {
+        Self {
+            view: Mat4::look_at_rh(eye, target, Vec3::Y),
+            projection: Mat4::perspective_rh(fov_y_radians, aspect.max(0.01), 0.05, 4000.0),
+        }
+    }
+
+    pub fn view_projection(&self) -> Mat4 {
+        self.projection * self.view
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct DrawPacket {
     pub model: Mat4,
+    pub color: [f32; 4],
     pub material: MaterialId,
     pub mesh: MeshId,
 }
@@ -217,13 +230,15 @@ impl VulkanRenderer {
     }
 
     pub fn extract_scene(&self, scene: &Scene) -> RenderWorld {
+        let mesh = self.default_mesh.unwrap_or(MeshId(0));
         let draw_packets = scene
             .world_matrices()
             .into_iter()
-            .map(|(_entity, model)| DrawPacket {
+            .map(|(entity, model)| DrawPacket {
                 model,
+                color: palette_color(entity.0),
                 material: MaterialId(0),
-                mesh: self.default_mesh.unwrap_or(MeshId(0)),
+                mesh,
             })
             .collect();
         RenderWorld { draw_packets }
@@ -247,17 +262,23 @@ impl VulkanRenderer {
         RenderWorld { draw_packets: visible }
     }
 
-    pub fn submit(&mut self, render_world: &RenderWorld) {
+    /// Submit a culled render world for presentation.
+    ///
+    /// `camera` provides the view-projection used by the GPU instanced pass and
+    /// `light_dir` is the world-space direction the key directional light points.
+    pub fn submit(&mut self, render_world: &RenderWorld, camera: &Camera, light_dir: Vec3) {
         self.draw_calls_last_frame = render_world.draw_packets.len();
         let _active_passes = self.frame_graph.pass_count();
         let _format = self.surface_format;
-        if let Some(backend) = self.backend.as_ref() {
+        if let Some(backend) = self.backend.as_mut() {
             let stats = backend.stats();
-            self.gpu_memory_budget_mb = (stats.extent.width.saturating_mul(stats.extent.height) / 4096)
+            self.gpu_memory_budget_mb = (stats.extent.width.saturating_mul(stats.extent.height)
+                / 4096)
                 .max(256);
             let _swapchain_info = (stats.swapchain_images, stats.swapchain_format);
-            if let Err(error) = backend.render_gbuffer_frame(render_world) {
-                tracing::warn!(?error, "gbuffer pass execution failed");
+            let view_proj = camera.view_projection();
+            if let Err(error) = backend.render_frame(render_world, view_proj, light_dir) {
+                tracing::warn!(?error, "scene pass execution failed");
             }
         }
         self.frame_time_ms = (self.draw_calls_last_frame as f32 * 0.01).max(0.1);
@@ -272,5 +293,110 @@ impl VulkanRenderer {
 
     pub fn is_backend_active(&self) -> bool {
         self.backend.is_some()
+    }
+
+    /// Recreate swapchain-dependent resources after a window resize.
+    pub fn resize(&mut self) {
+        if let Some(backend) = self.backend.as_mut() {
+            if let Err(error) = backend.recreate_swapchain() {
+                tracing::warn!(?error, "swapchain recreation failed");
+            }
+        }
+    }
+
+    /// Number of meshes resident on the GPU backend (0 when running headless).
+    pub fn resident_mesh_count(&self) -> usize {
+        self.mesh_assets.len()
+    }
+}
+
+/// Deterministic, pleasant per-entity color derived from its id.
+///
+/// Spreads hues using the golden-ratio conjugate so adjacent ids get
+/// well-separated, saturated colors without a lookup table.
+pub fn palette_color(seed: u64) -> [f32; 4] {
+    let hue = (seed as f32 * 0.618_034) % 1.0;
+    let saturation = 0.65;
+    let value = 0.95;
+    let (r, g, b) = hsv_to_rgb(hue, saturation, value);
+    [r, g, b, 1.0]
+}
+
+fn hsv_to_rgb(h: f32, s: f32, v: f32) -> (f32, f32, f32) {
+    let i = (h * 6.0).floor();
+    let f = h * 6.0 - i;
+    let p = v * (1.0 - s);
+    let q = v * (1.0 - f * s);
+    let t = v * (1.0 - (1.0 - f) * s);
+    match (i as i32) % 6 {
+        0 => (v, t, p),
+        1 => (q, v, p),
+        2 => (p, v, t),
+        3 => (p, q, v),
+        4 => (t, p, v),
+        _ => (v, p, q),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use engine_ecs::Transform;
+    use engine_scene::Scene;
+
+    #[test]
+    fn extract_produces_packet_per_entity() {
+        let mut scene = Scene::new();
+        scene.spawn_named("a", Transform::default());
+        scene.spawn_named("b", Transform::default());
+        let renderer = VulkanRenderer::new().expect("renderer");
+        let world = renderer.extract_scene(&scene);
+        assert_eq!(world.draw_packets.len(), 2);
+    }
+
+    #[test]
+    fn cull_removes_offscreen_entities() {
+        let mut scene = Scene::new();
+        // In front of the camera.
+        scene.spawn_named(
+            "front",
+            Transform {
+                translation: [0.0, 0.0, -5.0],
+                ..Default::default()
+            },
+        );
+        // Far behind the camera.
+        scene.spawn_named(
+            "behind",
+            Transform {
+                translation: [0.0, 0.0, 50.0],
+                ..Default::default()
+            },
+        );
+        let renderer = VulkanRenderer::new().expect("renderer");
+        let extracted = renderer.extract_scene(&scene);
+        let camera = Camera::looking_at(
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(0.0, 0.0, -1.0),
+            16.0 / 9.0,
+            60f32.to_radians(),
+        );
+        let visible = renderer.cull_visible(&extracted, &camera);
+        assert_eq!(extracted.draw_packets.len(), 2);
+        assert_eq!(visible.draw_packets.len(), 1);
+    }
+
+    #[test]
+    fn palette_is_deterministic_and_in_range() {
+        let c = palette_color(42);
+        assert_eq!(c, palette_color(42));
+        for channel in c {
+            assert!((0.0..=1.0).contains(&channel));
+        }
+    }
+
+    #[test]
+    fn deferred_frame_graph_has_expected_passes() {
+        assert_eq!(FrameGraph::deferred_default().pass_count(), 8);
     }
 }

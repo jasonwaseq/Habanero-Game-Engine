@@ -33,6 +33,12 @@ pub struct Scene {
     pub names: HashMap<Entity, String>,
 }
 
+impl Default for Scene {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Scene {
     pub fn new() -> Self {
         Self {
@@ -50,6 +56,15 @@ impl Scene {
 
     pub fn world_matrices(&self) -> Vec<(Entity, Mat4)> {
         let transforms = self.world.query::<Transform>();
+        let has_hierarchy = transforms.iter().any(|(_, t)| t.parent.is_some());
+        if !has_hierarchy {
+            // Fast path: no parenting, so local == world. Avoids building the
+            // per-frame lookup map for flat scenes (the common case).
+            return transforms
+                .into_iter()
+                .map(|(entity, transform)| (entity, transform_to_mat4(&transform)))
+                .collect();
+        }
         let lookup: HashMap<Entity, Transform> = transforms.iter().cloned().collect();
         transforms
             .into_iter()
